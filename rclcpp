@@ -1,0 +1,150 @@
+// serial_driver_node.cpp
+// 一个简单的 ROS2 串口通信驱动示例（Linux, termios）
+// 适用于 Foxy / Humble / Iron
+
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
+
+#include <termios.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+
+class SerialDriver : public rclcpp::Node
+{
+public:
+  SerialDriver() : Node("serial_driver")
+  {
+    // 声明参数
+    this->declare_parameter<std::string>("port", "/dev/ttyUSB0");
+    this->declare_parameter<int>("baudrate", 115200);
+    this->declare_parameter<int>("read_rate_hz", 50);
+
+    port_ = this->get_parameter("port").as_string();
+    baudrate_ = this->get_parameter("baudrate").as_int();
+    int rate = this->get_parameter("read_rate_hz").as_int();
+
+    // 打开串口
+    if (!openSerial())
+    {
+      RCLCPP_FATAL(this->get_logger(), "Failed to open serial port");
+      rclcpp::shutdown();
+      return;
+    }
+
+    // 发布接收到的数据
+    rx_pub_ = this->create_publisher<std_msgs::msg::String>("serial/rx", 10);
+
+    // 订阅要发送的数据
+    tx_sub_ = this->create_subscription<std_msgs::msg::String>(
+      "serial/tx", 10,
+      std::bind(&SerialDriver::txCallback, this, std::placeholders::_1));
+
+    // 定时读取串口
+    timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(1000 / rate),
+      std::bind(&SerialDriver::readSerial, this));
+
+    RCLCPP_INFO(this->get_logger(), "Serial driver started on %s", port_.c_str());
+  }
+
+  ~SerialDriver()
+  {
+    if (fd_ > 0)
+      close(fd_);
+  }
+
+private:
+  bool openSerial()
+  {
+    fd_ = open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd_ < 0)
+    {
+      RCLCPP_ERROR(this->get_logger(), "open %s failed: %s", port_.c_str(), strerror(errno));
+      return false;
+    }
+
+    struct termios tty;
+    memset(&tty, 0, sizeof tty);
+
+    if (tcgetattr(fd_, &tty) != 0)
+    {
+      RCLCPP_ERROR(this->get_logger(), "tcgetattr error: %s", strerror(errno));
+      return false;
+    }
+
+    speed_t speed;
+    switch (baudrate_)
+    {
+      case 9600: speed = B9600; break;
+      case 19200: speed = B19200; break;
+      case 38400: speed = B38400; break;
+      case 57600: speed = B57600; break;
+      case 115200: speed = B115200; break;
+      default:
+        RCLCPP_ERROR(this->get_logger(), "Unsupported baudrate");
+        return false;
+    }
+
+    cfsetispeed(&tty, speed);
+    cfsetospeed(&tty, speed);
+
+    tty.c_cflag |= (CLOCAL | CREAD);    // 启用接收
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;                 // 8bit
+    tty.c_cflag &= ~PARENB;             // 无校验
+    tty.c_cflag &= ~CSTOPB;             // 1 stop bit
+    tty.c_cflag &= ~CRTSCTS;             // 无硬件流控
+
+    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG); // 原始模式
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY);         // 无软件流控
+    tty.c_oflag &= ~OPOST;
+
+    tty.c_cc[VTIME] = 1; // 0.1s 超时
+    tty.c_cc[VMIN]  = 0;
+
+    if (tcsetattr(fd_, TCSANOW, &tty) != 0)
+    {
+      RCLCPP_ERROR(this->get_logger(), "tcsetattr error: %s", strerror(errno));
+      return false;
+    }
+
+    return true;
+  }
+
+  void readSerial()
+  {
+    char buffer[256];
+    int n = read(fd_, buffer, sizeof(buffer));
+    if (n > 0)
+    {
+      std_msgs::msg::String msg;
+      msg.data.assign(buffer, buffer + n);
+      rx_pub_->publish(msg);
+    }
+  }
+
+  void txCallback(const std_msgs::msg::String::SharedPtr msg)
+  {
+    if (fd_ < 0) return;
+    write(fd_, msg->data.c_str(), msg->data.size());
+  }
+
+private:
+  std::string port_;
+  int baudrate_;
+  int fd_{-1};
+
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr rx_pub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr tx_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
+};
+
+int main(int argc, char **argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<SerialDriver>());
+  rclcpp::shutdown();
+  return 0;
+}
