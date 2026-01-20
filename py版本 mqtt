@@ -10,29 +10,29 @@ class MqttUploaderNode(Node):
     def __init__(self):
         super().__init__('mqtt_uploader_node')
 
-        # ========= ROS2 参数 =========
+        # ---------- ROS2 参数 ----------
         self.declare_parameter('mqtt_host', '127.0.0.1')
         self.declare_parameter('mqtt_port', 1883)
         self.declare_parameter('mqtt_topic', 'rtk/pos')
-        self.declare_parameter('mqtt_client_id', 'rtk_mqtt_client')
+        self.declare_parameter('client_id', 'rtk_client')
 
         self.mqtt_host = self.get_parameter('mqtt_host').value
         self.mqtt_port = self.get_parameter('mqtt_port').value
         self.mqtt_topic = self.get_parameter('mqtt_topic').value
-        self.client_id = self.get_parameter('mqtt_client_id').value
+        self.client_id = self.get_parameter('client_id').value
 
-        # ========= MQTT =========
-        self.mqtt_client = mqtt.Client(client_id=self.client_id)
-        self.mqtt_client.on_connect = self.on_mqtt_connect
-        self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+        # ---------- MQTT ----------
+        self.client = mqtt.Client(client_id=self.client_id)
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
 
         self.get_logger().info(
-            f'Connecting MQTT {self.mqtt_host}:{self.mqtt_port}'
+            f'Connecting to MQTT {self.mqtt_host}:{self.mqtt_port}'
         )
-        self.mqtt_client.connect(self.mqtt_host, self.mqtt_port, 60)
-        self.mqtt_client.loop_start()
+        self.client.connect(self.mqtt_host, self.mqtt_port, 60)
+        self.client.loop_start()
 
-        # ========= ROS2 订阅 =========
+        # ---------- ROS2 订阅 ----------
         self.sub = self.create_subscription(
             NavSatFix,
             '/rtk/fix',
@@ -40,18 +40,14 @@ class MqttUploaderNode(Node):
             10
         )
 
-    # ================= MQTT callbacks =================
-
-    def on_mqtt_connect(self, client, userdata, flags, rc):
+    def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.get_logger().info('MQTT connected')
         else:
             self.get_logger().error(f'MQTT connect failed rc={rc}')
 
-    def on_mqtt_disconnect(self, client, userdata, rc):
+    def on_disconnect(self, client, userdata, rc):
         self.get_logger().warn('MQTT disconnected')
-
-    # ================= ROS2 callback =================
 
     def rtk_callback(self, msg: NavSatFix):
         payload = {
@@ -60,8 +56,7 @@ class MqttUploaderNode(Node):
             "alt": msg.altitude,
             "status": msg.status.status
         }
-
-        self.mqtt_client.publish(
+        self.client.publish(
             self.mqtt_topic,
             json.dumps(payload),
             qos=1
