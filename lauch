@@ -1,0 +1,21 @@
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package='rtk_ntrip_client',
+            executable='ntrip_client_node',
+            output='screen'
+        ),
+        Node(
+            package='rtk_serial_driver',
+            executable='rtk_driver_node',
+            output='screen'
+        ),
+        Node(
+            package='rtk_mqtt_uploader',
+            executable='mqtt_uploader_node',
+            output='screen'
+        ),
+    ])
