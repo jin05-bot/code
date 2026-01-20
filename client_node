@@ -1,0 +1,55 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+
+class NtripClientNode : public rclcpp::Node {
+public:
+  NtripClientNode() : Node("ntrip_client_node") {
+    open_serial();
+    connect_ntrip();
+    timer_ = create_wall_timer(
+      std::chrono::milliseconds(10),
+      std::bind(&NtripClientNode::forward_rtcm, this));
+  }
+
+private:
+  int sock_, serial_fd_;
+  rclcpp::TimerBase::SharedPtr timer_;
+
+  void open_serial() {
+    serial_fd_ = open("/dev/ttyUSB3", O_WRONLY | O_NOCTTY);
+    termios tio{};
+    cfsetospeed(&tio, B115200);
+    tio.c_cflag |= CS8 | CREAD | CLOCAL;
+    tcsetattr(serial_fd_, TCSANOW, &tio);
+  }
+
+  void connect_ntrip() {
+    sock_ = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8003);
+    inet_pton(AF_INET, "101.52.241.18", &addr.sin_addr);
+    connect(sock_, (sockaddr*)&addr, sizeof(addr));
+
+    std::string auth = "ytcors6074:fyx99768";
+    std::string req =
+      "GET /RTCM33GRCEJpro HTTP/1.1\r\n"
+      "User-Agent: NTRIP ROS\r\n"
+      "Authorization: Basic " +
+      base64(auth) + "\r\n\r\n";
+
+    send(sock_, req.c_str(), req.size(), 0);
+  }
+
+  void forward_rtcm() {
+    uint8_t buf[1024];
+    int n = recv(sock_, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n > 0) {
+      write(serial_fd_, buf, n);
+    }
+  }
+};
