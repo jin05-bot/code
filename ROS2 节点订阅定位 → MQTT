@@ -1,0 +1,28 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <mqtt/async_client.h>
+
+class MqttUploader : public rclcpp::Node {
+public:
+  MqttUploader() : Node("mqtt_uploader"),
+    client_("tcp://mqtt.xxx.com:1883", "rtk_client") {
+
+    sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
+      "rtk/fix", 10,
+      std::bind(&MqttUploader::callback, this, std::placeholders::_1));
+
+    client_.connect()->wait();
+  }
+
+private:
+  mqtt::async_client client_;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr sub_;
+
+  void callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
+    std::string payload =
+      "{\"lat\":" + std::to_string(msg->latitude) +
+      ",\"lon\":" + std::to_string(msg->longitude) + "}";
+
+    client_.publish("rtk/DEVICE_SN/pos", payload.c_str(), payload.size(), 1, false);
+  }
+};
