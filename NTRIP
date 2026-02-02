@@ -1,0 +1,191 @@
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
+
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <string>
+
+// ---------------- Base64 ----------------
+static const std::string base64_chars =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(const std::string &in)
+{
+    std::string out;
+    int val = 0, valb = -6;
+    for (uint8_t c : in) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(base64_chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6)
+        out.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4)
+        out.push_back('=');
+    return out;
+}
+
+// ---------------- Node ----------------
+class NtripClientNode : public rclcpp::Node
+{
+public:
+    NtripClientNode() : Node("ntrip_client_node")
+    {
+        // 发布 RTCM 给串口节点
+        rtcm_pub_ = create_publisher<std_msgs::msg::String>("serial/tx", 10);
+
+        // 订阅 GGA，用于回传
+        gga_sub_ = create_subscription<std_msgs::msg::String>(
+            "nmea/gga", 10,
+            std::bind(&NtripClientNode::ggaCallback, this, std::placeholders::_1)
+        );
+
+        last_gga_time_ = now();
+
+        RCLCPP_INFO(get_logger(), "NTRIP CLIENT started");
+
+        if (!connectNtrip()) {
+            RCLCPP_FATAL(get_logger(), "Failed to connect NTRIP server");
+            rclcpp::shutdown();
+            return;
+        }
+
+        // 定时检查 RTCM 数据 & 回传 GGA
+        timer_ = create_wall_timer(
+            std::chrono::milliseconds(10),
+            std::bind(&NtripClientNode::recvRtcm, this)
+        );
+    }
+
+private:
+    int sock_{-1};
+    bool http_done_{false};
+
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr rtcm_pub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr gga_sub_;
+    rclcpp::TimerBase::SharedPtr timer_;
+
+    std::string latest_gga_;
+    rclcpp::Time last_gga_time_;
+
+    // ---------- NTRIP 连接 ----------
+    bool connectNtrip()
+    {
+        sock_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock_ < 0) {
+            RCLCPP_ERROR(get_logger(), "socket failed: %s", strerror(errno));
+            return false;
+        }
+        RCLCPP_INFO(get_logger(), "Socket created");
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(8003); // NTRIP 端口
+        inet_pton(AF_INET, "101.52.241.18", &addr.sin_addr);
+
+        RCLCPP_INFO(get_logger(), "Connecting to NTRIP server...");
+        if (connect(sock_, (sockaddr *)&addr, sizeof(addr)) < 0) {
+            RCLCPP_ERROR(get_logger(), "connect failed: %s", strerror(errno));
+            return false;
+        }
+        RCLCPP_INFO(get_logger(), "TCP connection established");
+
+        // NTRIP 请求
+        std::string auth = "ytcors14655:fyx23758"; // 用户名:密码
+        std::string req =
+            "GET /RTCM33GRCEJpro HTTP/1.1\r\n"
+            "Host: 101.52.241.18\r\n"
+            "User-Agent: NTRIP-ROS2\r\n"
+            "Authorization: Basic " + base64_encode(auth) + "\r\n\r\n";
+
+        ssize_t sent = send(sock_, req.c_str(), req.size(), 0);
+        if (sent <= 0) {
+            RCLCPP_ERROR(get_logger(), "send() failed: %s", strerror(errno));
+            return false;
+        }
+        RCLCPP_INFO(get_logger(), "NTRIP request sent (%ld bytes)", sent);
+
+        // 接收响应头
+        char buf[1024] = {0};
+        ssize_t n = recv(sock_, buf, sizeof(buf)-1, 0);
+        if (n <= 0) {
+            RCLCPP_ERROR(get_logger(), "recv() header failed: %s", strerror(errno));
+            return false;
+        }
+        buf[n] = '\0';
+        RCLCPP_INFO(get_logger(), "NTRIP response header:\n%s", buf);
+
+        if (std::string(buf).find("200") == std::string::npos) {
+            RCLCPP_ERROR(get_logger(), "NTRIP connection rejected");
+            return false;
+        }
+
+        RCLCPP_INFO(get_logger(), "NTRIP connection accepted, start receiving RTCM");
+        http_done_ = true;
+        return true;
+    }
+
+    void recvRtcm()
+    {
+        if (sock_ < 0) return;
+
+        uint8_t buf[1024];
+        int n = recv(sock_, buf, sizeof(buf), MSG_DONTWAIT);
+
+        if (n > 0) {
+            if (!http_done_) {
+                std::string resp(reinterpret_cast<char *>(buf), n);
+                RCLCPP_INFO(get_logger(), "NTRIP response header:\n%s", resp.c_str());
+                http_done_ = true;
+                return;
+            }
+
+            // 发布 RTCM 数据给串口节点
+            std_msgs::msg::String msg;
+            msg.data.assign(reinterpret_cast<char *>(buf), n);
+            rtcm_pub_->publish(msg);
+
+            RCLCPP_DEBUG(get_logger(), "RTCM received: %d bytes", n);
+
+        } else if (n == 0) {
+            RCLCPP_ERROR(get_logger(), "NTRIP server closed connection");
+            rclcpp::shutdown();
+        } else {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                RCLCPP_ERROR(get_logger(), "recv error: %s", strerror(errno));
+            }
+        }
+
+        // GGA 回传，每5秒一次
+        rclcpp::Time now_time = now();
+        if (!latest_gga_.empty() && (now_time - last_gga_time_).seconds() > 5.0) {
+            int sent = send(sock_, latest_gga_.c_str(), latest_gga_.size(), 0);
+            if (sent > 0) {
+                RCLCPP_DEBUG(get_logger(), "GGA sent to NTRIP (%d bytes)", sent);
+            } else {
+                RCLCPP_WARN(get_logger(), "GGA send failed: %s", strerror(errno));
+            }
+            last_gga_time_ = now_time;
+        }
+    }
+
+    void ggaCallback(const std_msgs::msg::String::SharedPtr msg)
+    {
+        latest_gga_ = msg->data;
+    }
+};
+
+// ---------------- main ----------------
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<NtripClientNode>());
+    rclcpp::shutdown();
+    return 0;
+}
