@@ -1,0 +1,212 @@
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+
+#include <termios.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+
+#include <sstream>
+#include <vector>
+
+class SerialDriver : public rclcpp::Node
+{
+public:
+    SerialDriver() : Node("serial_driver")
+    {
+        declare_parameter<std::string>("port", "/dev/ttyUSB4");
+        declare_parameter<int>("baudrate", 115200);
+        declare_parameter<int>("read_rate_hz", 50);
+
+        port_ = get_parameter("port").as_string();
+        baudrate_ = get_parameter("baudrate").as_int();
+        int rate = get_parameter("read_rate_hz").as_int();
+
+        if (!openSerial()) {
+            RCLCPP_FATAL(get_logger(), "Failed to open serial port");
+            rclcpp::shutdown();
+            return;
+        }
+
+        rx_pub_  = create_publisher<std_msgs::msg::String>("serial/rx", 10);
+        fix_pub_ = create_publisher<sensor_msgs::msg::NavSatFix>("/rtk/fix", 10);
+        gga_pub_ = create_publisher<std_msgs::msg::String>("nmea/gga", 10);
+
+        tx_sub_ = create_subscription<std_msgs::msg::String>(
+            "serial/tx", 10,
+            std::bind(&SerialDriver::txCallback, this, std::placeholders::_1)
+        );
+
+        timer_ = create_wall_timer(
+            std::chrono::milliseconds(1000 / rate),
+            std::bind(&SerialDriver::readSerial, this)
+        );
+
+        RCLCPP_INFO(get_logger(),
+            "Serial driver started on %s @ %d",
+            port_.c_str(), baudrate_);
+    }
+
+    ~SerialDriver()
+    {
+        if (fd_ >= 0)
+            close(fd_);
+    }
+
+private:
+    // ★ 新增：波特率映射
+    speed_t baudrateToFlag(int baudrate)
+    {
+        switch (baudrate) {
+        case 9600: return B9600;
+        case 19200: return B19200;
+        case 38400: return B38400;
+        case 57600: return B57600;
+        case 115200: return B115200;
+        case 230400: return B230400;
+        case 460800: return B460800;
+        case 921600: return B921600;
+        default: return B115200;
+        }
+    }
+
+    bool openSerial()
+    {
+        fd_ = open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd_ < 0) {
+            RCLCPP_ERROR(get_logger(), "open %s failed: %s",
+                         port_.c_str(), strerror(errno));
+            return false;
+        }
+
+        termios tty{};
+        tcgetattr(fd_, &tty);
+        cfmakeraw(&tty);
+
+        // ★ 使用参数波特率
+        speed_t sp = baudrateToFlag(baudrate_);
+        cfsetispeed(&tty, sp);
+        cfsetospeed(&tty, sp);
+
+        tty.c_cflag |= (CLOCAL | CREAD);
+        tty.c_cflag &= ~CRTSCTS;
+
+        tty.c_cc[VTIME] = 1;
+        tty.c_cc[VMIN]  = 0;
+
+        tcsetattr(fd_, TCSANOW, &tty);
+        return true;
+    }
+
+    bool parseGGA(const std::string &gga,
+                  double &lat, double &lon, double &alt)
+    {
+        if (gga.find("$GPGGA") != 0 && gga.find("$GNGGA") != 0)
+            return false;
+
+        std::vector<std::string> f;
+        std::stringstream ss(gga);
+        std::string item;
+        while (std::getline(ss, item, ','))
+            f.push_back(item);
+
+        if (f.size() < 10 || f[2].empty() || f[4].empty())
+            return false;
+
+        double lat_raw = std::stod(f[2]);
+        int lat_deg = lat_raw / 100;
+        lat = lat_deg + (lat_raw - lat_deg * 100) / 60.0;
+        if (f[3] == "S") lat = -lat;
+
+        double lon_raw = std::stod(f[4]);
+        int lon_deg = lon_raw / 100;
+        lon = lon_deg + (lon_raw - lon_deg * 100) / 60.0;
+        if (f[5] == "W") lon = -lon;
+
+        alt = std::stod(f[9]);
+        return true;
+    }
+
+    void readSerial()
+    {
+        char buf[256];
+        int n = read(fd_, buf, sizeof(buf));
+        if (n <= 0) return;
+
+        std_msgs::msg::String raw;
+        raw.data.assign(buf, buf + n);
+        rx_pub_->publish(raw);
+
+        line_buffer_.append(buf, n);
+
+        size_t pos;
+        while ((pos = line_buffer_.find('\n')) != std::string::npos) {
+            std::string line = line_buffer_.substr(0, pos);
+            line_buffer_.erase(0, pos + 1);
+
+            double lat, lon, alt;
+            if (parseGGA(line, lat, lon, alt)) {
+                sensor_msgs::msg::NavSatFix fix;
+                fix.header.stamp = now();
+                fix.header.frame_id = "gps";
+                fix.latitude  = lat;
+                fix.longitude = lon;
+                fix.altitude  = alt;
+                fix.status.status =
+                    sensor_msgs::msg::NavSatStatus::STATUS_FIX;
+                fix.status.service =
+                    sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
+                fix_pub_->publish(fix);
+
+                std_msgs::msg::String gga_msg;
+                gga_msg.data = line + "\r\n";
+                gga_pub_->publish(gga_msg);
+            }
+        }
+    }
+
+    void txCallback(const std_msgs::msg::String::SharedPtr msg)
+    {
+        if (fd_ < 0 || msg->data.empty()) return;
+
+        // ★ 处理部分写
+        size_t total = 0;
+        const char *data = msg->data.data();
+        size_t len = msg->data.size();
+
+        while (total < len) {
+            ssize_t n = write(fd_, data + total, len - total);
+            if (n > 0) {
+                total += n;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                RCLCPP_ERROR(get_logger(),
+                    "serial write error: %s", strerror(errno));
+                break;
+            }
+        }
+    }
+
+private:
+    std::string port_;
+    int baudrate_;
+    int fd_{-1};
+    std::string line_buffer_;
+
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr rx_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr gga_pub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr tx_sub_;
+    rclcpp::TimerBase::SharedPtr timer_;
+};
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<SerialDriver>());
+    rclcpp::shutdown();
+    return 0;
+}
